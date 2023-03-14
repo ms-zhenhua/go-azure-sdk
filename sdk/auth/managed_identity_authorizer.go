@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -72,7 +73,7 @@ func (a *ManagedIdentityAuthorizer) Token(ctx context.Context, _ *http.Request) 
 
 	url := fmt.Sprintf("%s?%s", a.conf.MsiEndpoint, query.Encode())
 
-	body, err := azureMetadata(ctx, url)
+	body, err := retryForIMDS(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("ManagedIdentityAuthorizer: failed to request token from metadata endpoint: %v", err)
 	}
@@ -156,7 +157,7 @@ func (c *managedIdentityConfig) TokenSource(_ context.Context) (Authorizer, erro
 	})
 }
 
-func azureMetadata(ctx context.Context, url string) (body []byte, err error) {
+func azureMetadata(ctx context.Context, url string) (body []byte, statusCode int, err error) {
 	ctx2, cancel := context.WithDeadline(ctx, time.Now().Add(time.Second*30))
 	defer cancel()
 
@@ -191,9 +192,77 @@ func azureMetadata(ctx context.Context, url string) (body []byte, err error) {
 		return
 	}
 	defer resp.Body.Close()
-	if c := resp.StatusCode; c < 200 || c > 299 {
+	if statusCode = resp.StatusCode; statusCode < 200 || statusCode > 299 {
 		err = fmt.Errorf("received HTTP status %d with body: %s", resp.StatusCode, body)
 		return
 	}
 	return
+}
+
+func retryForIMDS(ctx context.Context, url string) (body []byte, err error) {
+	// see https://docs.microsoft.com/en-us/azure/active-directory/managed-service-identity/how-to-use-vm-token#retry-guidance
+	retries := []int{
+		http.StatusRequestTimeout,      // 408
+		http.StatusTooManyRequests,     // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout,      // 504
+	}
+
+	// extra retry status codes specific to IMDS
+	retries = append(retries,
+		http.StatusNotFound,
+		http.StatusGone,
+		// all remaining 5xx
+		http.StatusNotImplemented,
+		http.StatusHTTPVersionNotSupported,
+		http.StatusVariantAlsoNegotiates,
+		http.StatusInsufficientStorage,
+		http.StatusLoopDetected,
+		http.StatusNotExtended,
+		http.StatusNetworkAuthenticationRequired)
+
+	const msiMaxAttempts = 5
+	const maxDelay time.Duration = 60 * time.Second
+
+	attempt := 0
+	delay := time.Duration(0)
+
+	for attempt < msiMaxAttempts {
+		var statusCode int
+		body, statusCode, err = azureMetadata(ctx, url)
+		if err == nil || !hasStatusCode(statusCode, retries...) {
+			return
+		}
+
+		// perform exponential backoff with a cap.
+		// must increment attempt before calculating delay.
+		attempt++
+		// the base value of 2 is the "delta backoff" as specified in the guidance doc
+		delay += (time.Duration(math.Pow(2, float64(attempt))) * time.Second)
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		select {
+		case <-time.After(delay):
+			// intentionally left blank
+		case <-ctx.Done():
+			err = ctx.Err()
+			return
+		}
+	}
+
+	return
+}
+
+func hasStatusCode(statusCode int, codes ...int) bool {
+	for _, i := range codes {
+		if i == statusCode {
+			return true
+		}
+	}
+
+	return false
 }
